@@ -1,109 +1,302 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-from scipy.stats import poisson
-import math
 import re
+import pandas as pd
 
-# --- OKOSABB ADATGYŰJTŐ (KEZELI A MATEKOT) ---
-def safe_parse_75(text):
-    results = {}
-    lines = text.split('\n')
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        
-        # Keressük a sort: Sorszám az elején
-        first_num_match = re.match(r'^(\d+)', line)
-        if first_num_match:
-            idx = int(first_num_match.group(1))
-            
-            # Kikeressük az összes számot és a plusz jelet a sor végéről
-            # Ez megtalálja a "4.2 + 5.1" formátumot is
-            math_part = re.findall(r"[\d.]+\s*\+\s*[\d.]+|[\d.]+", line)
-            if math_part:
-                val_str = math_part[-1] # Az utolsó matematikai kifejezés a sorban
-                if '+' in val_str:
-                    # Ha van benne plusz jel, összeadjuk a részeket
-                    parts = val_str.split('+')
-                    val = sum(float(p.strip()) for p in parts)
+st.set_page_config(page_title="MakeYourStat Parser", layout="wide")
+st.title("⚽ MakeYourStat → 75 soros táblázat")
+st.caption("5 lépéses adatbevitel · Automatikus kinyerés · Checksum")
+
+# ============================================================
+# SEGÉDFÜGGVÉNYEK
+# ============================================================
+
+def get_lines(text):
+    return [l.strip() for l in text.split('\n') if l.strip()]
+
+def is_number(s):
+    try: float(s); return True
+    except: return False
+
+def find_3col(text, keyword, col):
+    """
+    Megkeresi a kulcsszót, majd a következő sorokban keresi
+    a 3 számértéket (L5, L10, All sorrendben - külön sorokban).
+    """
+    col_idx = {"L5": 0, "L10": 1, "All": 2}[col]
+    lines = get_lines(text)
+    for i, line in enumerate(lines):
+        if line.lower() == keyword.lower():
+            vals = []
+            j = i + 1
+            while j < len(lines) and len(vals) < 3:
+                if is_number(lines[j]):
+                    vals.append(float(lines[j]))
+                elif lines[j] in ['L5','L10','All','General','Extra Stats']:
+                    j += 1
+                    continue
                 else:
-                    val = float(val_str)
-                
-                if 1 <= idx <= 75:
-                    results[idx] = val
-    return results
+                    break
+                j += 1
+            if len(vals) >= 3:
+                return vals[col_idx]
+            elif len(vals) == 1:
+                return vals[0]
+    return None
 
-# --- UI ---
-st.set_page_config(page_title="Modell 2.1 - Smart Calc", layout="wide")
-st.title("🛡️ Modell 2.1 - Automata Matek Verzió")
+def find_liga_val(text, keyword):
+    """Liga egysoros értéke a kulcsszó után következő sorban."""
+    lines = get_lines(text)
+    for i, line in enumerate(lines):
+        if line.lower() == keyword.lower():
+            j = i + 1
+            while j < len(lines):
+                if is_number(lines[j]):
+                    return float(lines[j])
+                j += 1
+    return None
 
-st.info("Itt már nem kell az AI-nak számolnia. Ha beírod, hogy '4.2 + 5.1', az app összeadja!")
+def find_over105_liga(text):
+    lines = get_lines(text)
+    for i, line in enumerate(lines):
+        if "over/under 10.5 corners" in line.lower():
+            j = i + 1
+            while j < len(lines):
+                vals = re.findall(r'[\d.]+', lines[j])
+                if vals: return float(vals[0])
+                j += 1
+    return None
 
-summary_text = st.text_area("Másold be a 75 soros listát:", height=300)
+def find_over105_team(text, col):
+    col_idx = {"L5": 0, "L10": 1, "All": 2}[col]
+    lines = get_lines(text)
+    for i, line in enumerate(lines):
+        if line.lower() == "over 10.5 game":
+            vals = []
+            j = i + 1
+            while j < len(lines) and len(vals) < 3:
+                v = re.findall(r'[\d.]+', lines[j])
+                if v:
+                    vals.append(float(v[0]))
+                else:
+                    break
+                j += 1
+            if len(vals) >= 3:
+                return vals[col_idx]
+            elif len(vals) == 1:
+                return vals[0]
+    return None
 
-if st.button("📊 ELEMZÉS ÉS MATEK INDÍTÁSA"):
-    d = safe_parse_75(summary_text)
-    
-    if len(d) < 75:
-        missing = [i for i in range(1, 76) if i not in d]
-        st.error(f"❌ HIBA: Hiányzó sorszámok: {missing}")
-        st.stop()
-    
-    # Checksum ellenőrzés
-    current_checksum = sum(d.values())
-    st.metric(label="📊 App által számolt Checksum", value=f"{current_checksum:.4f}")
+def gc_val(text, col):
+    fh = find_3col(text, "Avg. game corners FH", col)
+    sh = find_3col(text, "Avg. game corners SH", col)
+    if fh is not None and sh is not None:
+        return f"{fh} + {sh}"
+    return "?"
 
-    # --- MATEK (Alkotmány szerint) ---
-    h_da_sa = (d[12] * 0.3) + (d[32] * 0.7)
-    h_sot_sa = (d[15] * 0.3) + (d[34] * 0.7)
-    h_sib_sa = (d[18] * 0.3) + (d[36] * 0.7)
-    h_sob_sa = (d[21] * 0.3) + (d[38] * 0.7)
-    h_against_sa = (d[24] * 0.3) + (d[40] * 0.7)
-    
-    a_da_sa = (d[45] * 0.3) + (d[65] * 0.7)
-    a_sot_sa = (d[48] * 0.3) + (d[67] * 0.7)
-    a_sib_sa = (d[51] * 0.3) + (d[69] * 0.7)
-    a_sob_sa = (d[54] * 0.3) + (d[71] * 0.7)
-    a_against_sa = (d[57] * 0.3) + (d[73] * 0.7)
+def parse_sections(liga, h_hm, h_ovr, v_aw, v_ovr):
+    d = {}
+    errors = []
 
-    l_da_h, l_sot_h, l_sib_h, l_sob_h, l_ct_h = d[5]/2, d[6]/2, d[7]/2, d[8]/2, d[1]/2
+    def s(key, val):
+        if val is not None:
+            d[key] = val
+        else:
+            d[key] = 0
+            errors.append(f"⚠️ Sor {key} ({NAMES.get(key,'')}): nem találtam")
 
-    def calc_ai(da, sot, sib, sob):
-        return (da/l_da_h)*0.35 + (sot/l_sot_h)*0.25 + (sib/l_sib_h)*0.25 + (sob/l_sob_h)*0.15
+    # LIGA
+    s(1,  find_liga_val(liga, "Avg. Corners"))
+    s(2,  find_liga_val(liga, "Home Avg. Corners"))
+    s(3,  find_liga_val(liga, "Away Avg. Corners"))
+    s(4,  find_liga_val(liga, "Avg. Total Shots"))
+    s(5,  find_liga_val(liga, "Avg. Dangerous Attacks"))
+    s(6,  find_liga_val(liga, "Avg. Shots on Target"))
+    s(7,  find_liga_val(liga, "Avg. Shots Inside Box"))
+    s(8,  find_liga_val(liga, "Avg. Shots Outside Box"))
+    s(9,  find_over105_liga(liga))
 
-    h_ai = calc_ai(h_da_sa, h_sot_sa, h_sib_sa, h_sob_sa)
-    a_ai = calc_ai(a_da_sa, a_sot_sa, a_sib_sa, a_sob_sa)
+    # HAZAI HOME
+    s(10, find_3col(h_hm, "Avg. dangerous attacks", "All"))
+    s(11, find_3col(h_hm, "Avg. dangerous attacks", "L10"))
+    s(12, find_3col(h_hm, "Avg. dangerous attacks", "L5"))
+    s(13, find_3col(h_hm, "Avg. shots on target", "All"))
+    s(14, find_3col(h_hm, "Avg. shots on target", "L10"))
+    s(15, find_3col(h_hm, "Avg. shots on target", "L5"))
+    s(16, find_3col(h_hm, "Avg. shots inside box", "All"))
+    s(17, find_3col(h_hm, "Avg. shots inside box", "L10"))
+    s(18, find_3col(h_hm, "Avg. shots inside box", "L5"))
+    s(19, find_3col(h_hm, "Avg. shots outside box", "All"))
+    s(20, find_3col(h_hm, "Avg. shots outside box", "L10"))
+    s(21, find_3col(h_hm, "Avg. shots outside box", "L5"))
+    s(22, find_3col(h_hm, "Avg. team corners against", "All"))
+    s(23, find_3col(h_hm, "Avg. team corners against", "L10"))
+    s(24, find_3col(h_hm, "Avg. team corners against", "L5"))
+    s(25, find_3col(h_hm, "Avg. shots", "All"))
+    s(26, find_3col(h_hm, "Avg. dangerous attacks", "All"))
+    s(27, find_over105_team(h_hm, "All"))
+    d[28] = gc_val(h_hm, "All")
+    d[29] = gc_val(h_hm, "L10")
+    d[30] = gc_val(h_hm, "L5")
 
-    h_szorzo = np.clip(a_against_sa / l_ct_h, 0.85, 1.15)
-    a_szorzo = np.clip(h_against_sa / l_ct_h, 0.85, 1.15)
-    
-    mu_h, mu_a = (l_ct_h * h_ai) * h_szorzo, (l_ct_h * a_ai) * a_szorzo
+    # HAZAI OVERALL
+    s(31, find_3col(h_ovr, "Avg. dangerous attacks", "L10"))
+    s(32, find_3col(h_ovr, "Avg. dangerous attacks", "L5"))
+    s(33, find_3col(h_ovr, "Avg. shots on target", "L10"))
+    s(34, find_3col(h_ovr, "Avg. shots on target", "L5"))
+    s(35, find_3col(h_ovr, "Avg. shots inside box", "L10"))
+    s(36, find_3col(h_ovr, "Avg. shots inside box", "L5"))
+    s(37, find_3col(h_ovr, "Avg. shots outside box", "L10"))
+    s(38, find_3col(h_ovr, "Avg. shots outside box", "L5"))
+    s(39, find_3col(h_ovr, "Avg. team corners against", "L10"))
+    s(40, find_3col(h_ovr, "Avg. team corners against", "L5"))
+    d[41] = gc_val(h_ovr, "L10")
+    d[42] = gc_val(h_ovr, "L5")
 
-    da_rel = ((d[26] + d[59]) / 2) / l_da_h
-    da_boost = max(0, (pow(da_rel, 1.5) - 1) * 0.12)
-    over_rel = ((d[27] + d[60]) / 2) / d[9]
-    vol_boost = max(0, (over_rel - 1) * 0.20)
-    isz = np.clip(1.0 + da_boost + vol_boost, 1.0, 1.3)
+    # VENDÉG AWAY
+    s(43, find_3col(v_aw, "Avg. dangerous attacks", "All"))
+    s(44, find_3col(v_aw, "Avg. dangerous attacks", "L10"))
+    s(45, find_3col(v_aw, "Avg. dangerous attacks", "L5"))
+    s(46, find_3col(v_aw, "Avg. shots on target", "All"))
+    s(47, find_3col(v_aw, "Avg. shots on target", "L10"))
+    s(48, find_3col(v_aw, "Avg. shots on target", "L5"))
+    s(49, find_3col(v_aw, "Avg. shots inside box", "All"))
+    s(50, find_3col(v_aw, "Avg. shots inside box", "L10"))
+    s(51, find_3col(v_aw, "Avg. shots inside box", "L5"))
+    s(52, find_3col(v_aw, "Avg. shots outside box", "All"))
+    s(53, find_3col(v_aw, "Avg. shots outside box", "L10"))
+    s(54, find_3col(v_aw, "Avg. shots outside box", "L5"))
+    s(55, find_3col(v_aw, "Avg. team corners against", "All"))
+    s(56, find_3col(v_aw, "Avg. team corners against", "L10"))
+    s(57, find_3col(v_aw, "Avg. team corners against", "L5"))
+    s(58, find_3col(v_aw, "Avg. shots", "All"))
+    s(59, find_3col(v_aw, "Avg. dangerous attacks", "All"))
+    s(60, find_over105_team(v_aw, "All"))
+    d[61] = gc_val(v_aw, "All")
+    d[62] = gc_val(v_aw, "L10")
+    d[63] = gc_val(v_aw, "L5")
 
-    final_h, final_a = mu_h * isz, mu_a * isz
+    # VENDÉG OVERALL
+    s(64, find_3col(v_ovr, "Avg. dangerous attacks", "L10"))
+    s(65, find_3col(v_ovr, "Avg. dangerous attacks", "L5"))
+    s(66, find_3col(v_ovr, "Avg. shots on target", "L10"))
+    s(67, find_3col(v_ovr, "Avg. shots on target", "L5"))
+    s(68, find_3col(v_ovr, "Avg. shots inside box", "L10"))
+    s(69, find_3col(v_ovr, "Avg. shots inside box", "L5"))
+    s(70, find_3col(v_ovr, "Avg. shots outside box", "L10"))
+    s(71, find_3col(v_ovr, "Avg. shots outside box", "L5"))
+    s(72, find_3col(v_ovr, "Avg. team corners against", "L10"))
+    s(73, find_3col(v_ovr, "Avg. team corners against", "L5"))
+    d[74] = gc_val(v_ovr, "L10")
+    d[75] = gc_val(v_ovr, "L5")
 
-    # --- EREDMÉNYEK ---
-    st.subheader("🏁 Tippek (Arany Zóna 80-96%)")
-    def get_tips(m):
-        return [f"Több mint {k} ({1-poisson.cdf(k, m):.1%})" for k in range(0, 15) if 0.80 <= (1-poisson.cdf(k, m)) <= 0.96]
+    return d, errors
 
-    res = []
-    for t in get_tips(final_h + final_a): res.append(["Összesített", t])
-    for t in get_tips(final_h): res.append(["Hazai", t])
-    for t in get_tips(final_a): res.append(["Vendég", t])
+NAMES = {
+    1:"Avg. Corners",2:"Home Avg. Corners",3:"Away Avg. Corners",
+    4:"Avg. Total Shots",5:"Dangerous Attacks",6:"SoT",7:"SIB",8:"SOB",
+    9:"Over 10.5 game%",10:"Hazai DA (All)",11:"Hazai DA (L10)",12:"Hazai DA (L5)",
+    13:"Hazai SoT (All)",14:"Hazai SoT (L10)",15:"Hazai SoT (L5)",
+    16:"Hazai SIB (All)",17:"Hazai SIB (L10)",18:"Hazai SIB (L5)",
+    19:"Hazai SOB (All)",20:"Hazai SOB (L10)",21:"Hazai SOB (L5)",
+    22:"Hazai Against (All)",23:"Hazai Against (L10)",24:"Hazai Against (L5)",
+    25:"Hazai avg lövés",26:"Hazai avg DA",27:"Hazai Over 10.5 game%",
+    28:"Hazai GC (All)",29:"Hazai GC (L10)",30:"Hazai GC (L5)",
+    31:"Hazai OVR DA (L10)",32:"Hazai OVR DA (L5)",
+    33:"Hazai OVR SoT (L10)",34:"Hazai OVR SoT (L5)",
+    35:"Hazai OVR SIB (L10)",36:"Hazai OVR SIB (L5)",
+    37:"Hazai OVR SOB (L10)",38:"Hazai OVR SOB (L5)",
+    39:"Hazai OVR Against (L10)",40:"Hazai OVR Against (L5)",
+    41:"Hazai OVR GC (L10)",42:"Hazai OVR GC (L5)",
+    43:"Vendég DA (All)",44:"Vendég DA (L10)",45:"Vendég DA (L5)",
+    46:"Vendég SoT (All)",47:"Vendég SoT (L10)",48:"Vendég SoT (L5)",
+    49:"Vendég SIB (All)",50:"Vendég SIB (L10)",51:"Vendég SIB (L5)",
+    52:"Vendég SOB (All)",53:"Vendég SOB (L10)",54:"Vendég SOB (L5)",
+    55:"Vendég Against (All)",56:"Vendég Against (L10)",57:"Vendég Against (L5)",
+    58:"Vendég avg lövés",59:"Vendég avg DA",60:"Vendég Over 10.5 game%",
+    61:"Vendég GC (All)",62:"Vendég GC (L10)",63:"Vendég GC (L5)",
+    64:"Vendég OVR DA (L10)",65:"Vendég OVR DA (L5)",
+    66:"Vendég OVR SoT (L10)",67:"Vendég OVR SoT (L5)",
+    68:"Vendég OVR SIB (L10)",69:"Vendég OVR SIB (L5)",
+    70:"Vendég OVR SOB (L10)",71:"Vendég OVR SOB (L5)",
+    72:"Vendég OVR Against (L10)",73:"Vendég OVR Against (L5)",
+    74:"Vendég OVR GC (L10)",75:"Vendég OVR GC (L5)",
+}
 
-    if res:
-        st.table(pd.DataFrame(res, columns=["Kategória", "Tipp"]))
+STEPS = {
+    1: ("🏆 1. Liga adatok", "A liga stat oldalát másold be (pl. Liga Profesional → Stats → Overview)."),
+    2: ("🏠 2. Hazai csapat — HOME tab", "Hazai csapat → Stats → **Home stats** nézet → másold be az egészet."),
+    3: ("📊 3. Hazai csapat — OVERALL tab", "Ugyanott → kattints az **Overall** (alapértelmezett) nézetre → másold be."),
+    4: ("✈️ 4. Vendég csapat — AWAY tab", "Vendég csapat → Stats → **Away stats** nézet → másold be."),
+    5: ("📊 5. Vendég csapat — OVERALL tab", "Ugyanott → kattints az **Overall** nézetre → másold be."),
+}
+
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "sections" not in st.session_state:
+    st.session_state.sections = {}
+
+# Progress
+st.progress((st.session_state.step - 1) / 5, text=f"Lépés {min(st.session_state.step,5)}/5")
+
+if st.session_state.step <= 5:
+    step = st.session_state.step
+    title, instruction = STEPS[step]
+    st.subheader(title)
+    st.info(f"ℹ️ {instruction}")
+
+    text = st.text_area("Másold be a szöveget:", height=250, key=f"input_{step}")
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if step > 1:
+            if st.button("⬅️ Vissza"):
+                st.session_state.step -= 1
+                st.rerun()
+    with col2:
+        btn = "➡️ Következő" if step < 5 else "✅ Feldolgozás!"
+        if st.button(btn, type="primary"):
+            if not text.strip():
+                st.error("Üres szöveg!")
+            else:
+                keys = ["liga","h_hm","h_ovr","v_aw","v_ovr"]
+                st.session_state.sections[keys[step-1]] = text
+                st.session_state.step += 1
+                st.rerun()
+
+else:
+    s = st.session_state.sections
+    d, errors = parse_sections(
+        s.get("liga",""), s.get("h_hm",""),
+        s.get("h_ovr",""), s.get("v_aw",""), s.get("v_ovr","")
+    )
+
+    checksum = 0
+    for i in range(1,76):
+        val = d.get(i,0)
+        if isinstance(val,(int,float)): checksum += val
+        elif isinstance(val,str) and '+' in val:
+            try: checksum += sum(float(p.strip()) for p in val.split('+'))
+            except: pass
+
+    if errors:
+        with st.expander(f"⚠️ {len(errors)} hiányzó érték"):
+            for e in errors: st.write(e)
     else:
-        st.info("Nincs tipp az Arany Zónában.")
+        st.success("✅ Mind a 75 sor sikeresen kinyerve!")
 
-    with st.expander("🔍 Adatellenőrzés (Itt látod az összeadott értékeket)"):
-        check_df = pd.DataFrame([{"Sorszám": i, "Érték": d[i]} for i in range(1, 76)])
-        st.dataframe(check_df, height=300)
-              
+    st.metric("📊 Checksum", f"{checksum:.4f}")
+
+    rows = [{"#": i, "Megnevezés": NAMES.get(i,""), "Érték": d.get(i,"?")} for i in range(1,76)]
+    st.dataframe(pd.DataFrame(rows), height=500, use_container_width=True)
+
+    st.subheader("📋 Másolható formátum → Elemző appba")
+    out = "Sorszám Megnevezés Érték\n"
+    for i in range(1,76):
+        out += f"{i} {NAMES.get(i,'')} {d.get(i,'?')}\n"
+    out += f"Checksum {checksum:.4f}"
+    st.text_area("", value=out, height=300)
+
+    if st.button("🔄 Új meccs"):
+        st.session_state.step = 1
+        st.session_state.sections = {}
+        st.rerun()
