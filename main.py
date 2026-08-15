@@ -1,631 +1,500 @@
 # -*- coding: utf-8 -*-
 """
-CORNER PREDICTION MODEL v14.0 - VÉGLEGES TELJES VERZIÓ
-=======================================================
+MAKEYOURSTAT STRICT EXTRACTOR v1.0
+==================================
 
-5 LÉPCSŐS ADAT-BEADÁS:
-    1. Liga stat fájl
-    2. Hazai csapat ALL stat fájl
-    3. Hazai csapat HOME stat fájl
-    4. Vendég csapat ALL stat fájl
-    5. Vendég csapat AWAY stat fájl
+Cél:
+- 5 lépcsős raw input
+- explicit adatok kinyerése
+- semmi becslés / találgatás
+- raw-extract tábla
+- model-ready tábla
+- audit report
 
 HASZNÁLAT:
-    python corner_model_v14.py liga.txt home_all.txt home_home.txt away_all.txt away_away.txt
+    python makeyourstat_extractor_v1.py
 
-PÉLDA:
-    python corner_model_v14.py \\
-        eliteserien.txt \\
-        rosenborg_all.txt \\
-        rosenborg_home.txt \\
-        viking_all.txt \\
-        viking_away.txt
+A program 5 lépésben bekéri az 5 txt fájlt:
+    1) liga raw txt
+    2) hazai all raw txt
+    3) hazai home raw txt
+    4) vendég all raw txt
+    5) vendég away raw txt
 
-Várható teljesítmény: MAE 0.8-1.2 (vs. v13: 2.25-2.91)
+Kimenet:
+    - <prefix>_league_table.csv
+    - <prefix>_team_table.csv
+    - <prefix>_model_ready.csv
+    - <prefix>_audit.txt
+
+Megjegyzés:
+- A százalékok normalizált formában lesznek tárolva: pl. 41% -> 0.41
 """
 
+import csv
 import re
-import sys
-from typing import Dict, List, Optional
-from dataclasses import dataclass
-from scipy.stats import poisson
-import numpy as np
+import unicodedata
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
 
 
 # =============================================================================
-# KONFIGURÁCIÓ
+# 1. SEGÉDFÜGGVÉNYEK
 # =============================================================================
 
-class Config:
-    """Modell paraméterek."""
-    # Lambda komponens súlyok (összesen 100%)
-    W_DIRECT = 0.45          # Direct corner (legfontosabb)
-    W_ATTACK_DEFENSE = 0.25  # Attack × Defense interaction
-    W_OVER_PROFILE = 0.15    # Over/Under profil
-    W_FORM = 0.10            # Forma (PPG, Won%)
-    W_TIME = 0.05            # Időzóna trendek
-    
-    # Context súlyozás (Home/Away vs Overall)
-    W_SPECIFIC = 0.70  # Home/Away specifikus stat
-    W_OVERALL = 0.30   # Overall stat
-    
-    # Attack profile súlyok
-    W_DA = 0.35
-    W_SOT = 0.30
-    W_SIB = 0.20
-    W_SOB = 0.10
-    W_ATTACKS = 0.05
-    
-    # Puffer és threshold
-    BUFFER_MULT = 1.5    # buffer = 1.5 × sqrt(lambda)
-    MIN_PROB = 0.45      # Minimum 45% valószínűség
+def strip_accents(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in text if not unicodedata.combining(c))
 
+def norm_text(text: str) -> str:
+    text = strip_accents(text).lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-# =============================================================================
-# ADATSTRUKTÚRÁK
-# =============================================================================
+def clean_lines(raw: str) -> List[str]:
+    return [line.strip() for line in raw.splitlines() if line.strip()]
 
-@dataclass
-class LeagueStats:
-    """Liga átlagok."""
-    name: str = "Liga"
-    avg_corners: float = 10.0
-    home_avg: float = 5.5
-    away_avg: float = 4.5
-    avg_corners_ht: float = 5.0
-    avg_corners_sh: float = 5.0
-    over_10_5_pct: float = 50.0
-    avg_da: float = 100.0
-    avg_sot: float = 9.0
-    avg_sib: float = 16.0
-    avg_sob: float = 8.0
-    avg_attacks: float = 195.0
-    avg_goals: float = 2.5
-
-
-@dataclass
-class TeamStats:
-    """Csapat statisztikák."""
-    name: str = "Team"
-    context: str = "all"  # all/home/away
-    
-    # Corners
-    corners_l5: float = 5.0
-    corners_l10: float = 5.0
-    corners_all: float = 5.0
-    corners_against_l5: float = 4.5
-    corners_against_l10: float = 4.5
-    
-    # Over profile
-    over_5_5_pct: float = 50.0
-    over_4_5_pct: float = 60.0
-    over_5_5_against_pct: float = 50.0
-    
-    # Attack
-    da_l5: float = 50.0
-    da_l10: float = 50.0
-    attacks_l5: float = 100.0
-    sot_l5: float = 4.5
-    sot_l10: float = 4.5
-    sib_l5: float = 8.0
-    sob_l5: float = 4.0
-    
-    # Defense
-    da_against_l5: float = 50.0
-    sot_against_l5: float = 4.5
-    
-    # Goals & xG
-    goals_scored_l5: float = 1.5
-    goals_conceded_l5: float = 1.5
-    xg_l5: Optional[float] = None
-    xga_l5: Optional[float] = None
-    
-    # Form
-    won_l5: float = 0.4
-    won_l10: float = 0.4
-    ppg_l5: float = 1.5
-    ppg_l10: float = 1.5
-    
-    # Time
-    corners_0_10_pct: float = 60.0
-    corners_80_ft_pct: float = 80.0
-    corners_ht_l5: Optional[float] = None
-    corners_sh_l5: Optional[float] = None
-
-
-# =============================================================================
-# PARSER (MAKEYOURSTAT → STRUKTÚRÁK)
-# =============================================================================
-
-class Parser:
-    """Makeyourstat nyers szöveg → adatstruktúra."""
-    
-    @staticmethod
-    def _extract_float(text: str, pattern: str, default: float) -> float:
-        """Regex-szel float kinyerése."""
-        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-        if m:
-            try:
-                return float(m.group(1).replace(',', '.'))
-            except:
-                return default
-        return default
-    
-    @staticmethod
-    def _extract_pct(text: str, pattern: str, default: float) -> float:
-        """Százalék kinyerése."""
-        val = Parser._extract_float(text, pattern, default)
-        if 0 < val <= 1:
-            val *= 100
-        return val
-    
-    @staticmethod
-    def parse_league(raw: str) -> LeagueStats:
-        """Liga stat parsing."""
-        f = Parser._extract_float
-        p = Parser._extract_pct
-        
-        return LeagueStats(
-            name=re.search(r'(\w+)', raw).group(1) if re.search(r'(\w+)', raw) else "Liga",
-            avg_corners=f(raw, r'Avg\.?\s*Corners[:\s]+([\d.,]+)', 10.0),
-            home_avg=f(raw, r'Home\s+Avg\.?\s*Corners[:\s]+([\d.,]+)', 5.5),
-            away_avg=f(raw, r'Away\s+Avg\.?\s*Corners[:\s]+([\d.,]+)', 4.5),
-            avg_corners_ht=f(raw, r'Avg\.?\s*Corners\s+(?:HT|FH)[:\s]+([\d.,]+)', 5.0),
-            avg_corners_sh=f(raw, r'Avg\.?\s*Corners\s+(?:SH|2H)[:\s]+([\d.,]+)', 5.0),
-            over_10_5_pct=p(raw, r'Over\s+10\.5[:\s]+([\d.,]+)\s*%?', 50.0),
-            avg_da=f(raw, r'Dangerous\s+Attacks[:\s]+([\d.,]+)', 100.0),
-            avg_sot=f(raw, r'Shots\s+on\s+Target[:\s]+([\d.,]+)', 9.0),
-            avg_sib=f(raw, r'Shots\s+Inside\s+Box[:\s]+([\d.,]+)', 16.0),
-            avg_sob=f(raw, r'Shots\s+Outside\s+Box[:\s]+([\d.,]+)', 8.0),
-            avg_attacks=f(raw, r'Avg\.?\s*Attacks[:\s]+([\d.,]+)', 195.0),
-            avg_goals=f(raw, r'Avg\.?\s*Goals[:\s]+([\d.,]+)', 2.5),
-        )
-    
-    @staticmethod
-    def parse_team(raw: str, context: str) -> TeamStats:
-        """Csapat stat parsing."""
-        f = Parser._extract_float
-        p = Parser._extract_pct
-        
-        return TeamStats(
-            name=re.search(r'^(.+?)(?:\n|Stats)', raw, re.MULTILINE).group(1).strip() if re.search(r'^(.+?)(?:\n|Stats)', raw, re.MULTILINE) else "Team",
-            context=context,
-            
-            corners_l5=f(raw, r'corners.*?L5[:\s]+([\d.,]+)', 5.0),
-            corners_l10=f(raw, r'corners.*?L10[:\s]+([\d.,]+)', 5.0),
-            corners_all=f(raw, r'corners.*?All[:\s]+([\d.,]+)', 5.0),
-            corners_against_l5=f(raw, r'against.*?L5[:\s]+([\d.,]+)', 4.5),
-            corners_against_l10=f(raw, r'against.*?L10[:\s]+([\d.,]+)', 4.5),
-            
-            over_5_5_pct=p(raw, r'Over\s+5\.5\s+team[:\s]+([\d.,]+)\s*%?', 50.0),
-            over_4_5_pct=p(raw, r'Over\s+4\.5\s+team[:\s]+([\d.,]+)\s*%?', 60.0),
-            over_5_5_against_pct=p(raw, r'Over\s+5\.5.*?against[:\s]+([\d.,]+)\s*%?', 50.0),
-            
-            da_l5=f(raw, r'[Dd]angerous.*?L5[:\s]+([\d.,]+)', 50.0),
-            da_l10=f(raw, r'[Dd]angerous.*?L10[:\s]+([\d.,]+)', 50.0),
-            attacks_l5=f(raw, r'[Aa]ttacks.*?L5[:\s]+([\d.,]+)', 100.0),
-            sot_l5=f(raw, r'[Ss]hots\s+on\s+[Tt]arget.*?L5[:\s]+([\d.,]+)', 4.5),
-            sot_l10=f(raw, r'[Ss]hots\s+on\s+[Tt]arget.*?L10[:\s]+([\d.,]+)', 4.5),
-            sib_l5=f(raw, r'[Ii]nside.*?L5[:\s]+([\d.,]+)', 8.0),
-            sob_l5=f(raw, r'[Oo]utside.*?L5[:\s]+([\d.,]+)', 4.0),
-            
-            da_against_l5=f(raw, r'[Dd]angerous.*?[Aa]gainst.*?L5[:\s]+([\d.,]+)', 50.0),
-            sot_against_l5=f(raw, r'[Ss]hots.*?[Aa]gainst.*?L5[:\s]+([\d.,]+)', 4.5),
-            
-            goals_scored_l5=f(raw, r'[Gg]oals.*?(?:[Ss]cored|for).*?L5[:\s]+([\d.,]+)', 1.5),
-            goals_conceded_l5=f(raw, r'[Gg]oals.*?(?:[Cc]onceded|[Aa]gainst).*?L5[:\s]+([\d.,]+)', 1.5),
-            xg_l5=f(raw, r'xG.*?L5[:\s]+([\d.,]+)', None),
-            xga_l5=f(raw, r'xGA.*?L5[:\s]+([\d.,]+)', None),
-            
-            won_l5=p(raw, r'[Ww]on.*?L5[:\s]+([\d.,]+)\s*%?', 40.0) / 100.0,
-            won_l10=p(raw, r'[Ww]on.*?L10[:\s]+([\d.,]+)\s*%?', 40.0) / 100.0,
-            ppg_l5=f(raw, r'PPG.*?L5[:\s]+([\d.,]+)', 1.5),
-            ppg_l10=f(raw, r'PPG.*?L10[:\s]+([\d.,]+)', 1.5),
-            
-            corners_0_10_pct=p(raw, r'0.*?10[:\s]+([\d.,]+)\s*%?', 60.0),
-            corners_80_ft_pct=p(raw, r'80.*?[:\s]+([\d.,]+)\s*%?', 80.0),
-            corners_ht_l5=f(raw, r'HT.*?L5[:\s]+([\d.,]+)', None),
-            corners_sh_l5=f(raw, r'SH.*?L5[:\s]+([\d.,]+)', None),
-        )
-
-
-# =============================================================================
-# CORNER MODEL v14.0
-# =============================================================================
-
-class CornerModel:
-    """Fejlett corner prediction model."""
-    
-    def __init__(self):
-        self.config = Config()
-    
-    def predict(
-        self,
-        league: LeagueStats,
-        home_all: TeamStats,
-        home_spec: TeamStats,
-        away_all: TeamStats,
-        away_spec: TeamStats
-    ) -> Dict:
-        """
-        Teljes predikció.
-        
-        Args:
-            league: Liga statisztikák
-            home_all: Hazai ALL
-            home_spec: Hazai HOME
-            away_all: Vendég ALL
-            away_spec: Vendég AWAY
-        """
-        # Context-weighted kombinálás
-        home = self._combine(home_all, home_spec)
-        away = self._combine(away_all, away_spec)
-        
-        # Lambda számítás (5 komponens)
-        lh = self._calc_lambda(home, away, league, True)
-        la = self._calc_lambda(away, home, league, False)
-        lt = lh + la
-        
-        # Predikciók
-        ph = max(0, round(lh))
-        pa = max(0, round(la))
-        pt = max(0, round(lt))
-        
-        # Confidence
-        ci = (int(poisson.ppf(0.05, lt)), int(poisson.ppf(0.95, lt)))
-        
-        # Tippek
-        tips = self._gen_tips(lh, la, lt)
-        
-        # Breakdown
-        bd = self._breakdown(home, away, league)
-        
-        return {
-            'lambda_home': lh,
-            'lambda_away': la,
-            'lambda_total': lt,
-            'pred_home': ph,
-            'pred_away': pa,
-            'pred_total': pt,
-            'confidence': ci,
-            'tips': tips,
-            'breakdown': bd
-        }
-    
-    def _combine(self, all_stat: TeamStats, spec_stat: TeamStats) -> TeamStats:
-        """70% specifikus + 30% overall."""
-        w1, w2 = self.config.W_SPECIFIC, self.config.W_OVERALL
-        
-        return TeamStats(
-            name=spec_stat.name,
-            context=spec_stat.context,
-            corners_l5=w1*spec_stat.corners_l5 + w2*all_stat.corners_l5,
-            corners_l10=w1*spec_stat.corners_l10 + w2*all_stat.corners_l10,
-            corners_all=w1*spec_stat.corners_all + w2*all_stat.corners_all,
-            corners_against_l5=w1*spec_stat.corners_against_l5 + w2*all_stat.corners_against_l5,
-            corners_against_l10=w1*spec_stat.corners_against_l10 + w2*all_stat.corners_against_l10,
-            over_5_5_pct=w1*spec_stat.over_5_5_pct + w2*all_stat.over_5_5_pct,
-            over_4_5_pct=w1*spec_stat.over_4_5_pct + w2*all_stat.over_4_5_pct,
-            over_5_5_against_pct=w1*spec_stat.over_5_5_against_pct + w2*all_stat.over_5_5_against_pct,
-            da_l5=w1*spec_stat.da_l5 + w2*all_stat.da_l5,
-            da_l10=w1*spec_stat.da_l10 + w2*all_stat.da_l10,
-            attacks_l5=w1*spec_stat.attacks_l5 + w2*all_stat.attacks_l5,
-            sot_l5=w1*spec_stat.sot_l5 + w2*all_stat.sot_l5,
-            sot_l10=w1*spec_stat.sot_l10 + w2*all_stat.sot_l10,
-            sib_l5=w1*spec_stat.sib_l5 + w2*all_stat.sib_l5,
-            sob_l5=w1*spec_stat.sob_l5 + w2*all_stat.sob_l5,
-            da_against_l5=w1*spec_stat.da_against_l5 + w2*all_stat.da_against_l5,
-            sot_against_l5=w1*spec_stat.sot_against_l5 + w2*all_stat.sot_against_l5,
-            goals_scored_l5=w1*spec_stat.goals_scored_l5 + w2*all_stat.goals_scored_l5,
-            goals_conceded_l5=w1*spec_stat.goals_conceded_l5 + w2*all_stat.goals_conceded_l5,
-            xg_l5=spec_stat.xg_l5 or all_stat.xg_l5,
-            xga_l5=spec_stat.xga_l5 or all_stat.xga_l5,
-            won_l5=w1*spec_stat.won_l5 + w2*all_stat.won_l5,
-            won_l10=w1*spec_stat.won_l10 + w2*all_stat.won_l10,
-            ppg_l5=w1*spec_stat.ppg_l5 + w2*all_stat.ppg_l5,
-            ppg_l10=w1*spec_stat.ppg_l10 + w2*all_stat.ppg_l10,
-            corners_0_10_pct=spec_stat.corners_0_10_pct,
-            corners_80_ft_pct=spec_stat.corners_80_ft_pct,
-            corners_ht_l5=spec_stat.corners_ht_l5 or all_stat.corners_ht_l5,
-            corners_sh_l5=spec_stat.corners_sh_l5 or all_stat.corners_sh_l5,
-        )
-    
-    def _calc_lambda(self, team: TeamStats, opp: TeamStats, league: LeagueStats, is_home: bool) -> float:
-        """5 komponensű lambda."""
-        c = self.config
-        
-        # 1. Direct (45%)
-        direct = self._direct(team, league, is_home)
-        
-        # 2. Attack-Defense (25%)
-        ad = self._attack_defense(team, opp, league, is_home)
-        
-        # 3. Over profile (15%)
-        over = self._over_prof(team, opp, league)
-        
-        # 4. Form (10%)
-        form = self._form(team, league, is_home)
-        
-        # 5. Time (5%)
-        time = self._time(team, league)
-        
-        return max(0.0, c.W_DIRECT*direct + c.W_ATTACK_DEFENSE*ad + c.W_OVER_PROFILE*over + c.W_FORM*form + c.W_TIME*time)
-    
-    def _direct(self, t: TeamStats, l: LeagueStats, is_home: bool) -> float:
-        """Direct corner component."""
-        # Forma-adaptív súlyozás
-        l5, l10, all = t.corners_l5, t.corners_l10, t.corners_all
-        mom = (l5 - l10) / max(l10, 1.0)
-        
-        if mom > 0.20:
-            w5, w10, wall = 0.65, 0.25, 0.10
-        elif mom < -0.20:
-            w5, w10, wall = 0.35, 0.45, 0.20
-        else:
-            w5, w10, wall = 0.50, 0.30, 0.20
-        
-        weighted = w5*l5 + w10*l10 + wall*all
-        baseline = l.home_avg if is_home else l.away_avg
-        
-        return (weighted / max(baseline, 1.0)) * baseline
-    
-    def _attack_defense(self, t: TeamStats, o: TeamStats, l: LeagueStats, is_home: bool) -> float:
-        """Attack × Defense."""
-        attack = self._attack_prof(t, l)
-        defense = self._defense_weak(o, l)
-        baseline = l.home_avg if is_home else l.away_avg
-        
-        return attack * defense * baseline
-    
-    def _attack_prof(self, t: TeamStats, l: LeagueStats) -> float:
-        """Attack profile (normalized)."""
-        c = self.config
-        da = (0.6*t.da_l5 + 0.4*t.da_l10) / max(l.avg_da, 1.0)
-        sot = (0.6*t.sot_l5 + 0.4*t.sot_l10) / max(l.avg_sot, 1.0)
-        sib = t.sib_l5 / max(l.avg_sib, 1.0)
-        sob = t.sob_l5 / max(l.avg_sob, 1.0)
-        att = t.attacks_l5 / max(l.avg_attacks, 1.0)
-        
-        return c.W_DA*da + c.W_SOT*sot + c.W_SIB*sib + c.W_SOB*sob + c.W_ATTACKS*att
-    
-    def _defense_weak(self, t: TeamStats, l: LeagueStats) -> float:
-        """Defense weakness."""
-        ca = 0.6*t.corners_against_l5 + 0.4*t.corners_against_l10
-        gc = t.goals_conceded_l5
-        da_ag = t.da_against_l5
-        
-        weak = 0.6*ca + 0.25*(gc*1.5) + 0.15*(da_ag/10.0)
-        baseline = (l.home_avg + l.away_avg) / 2
-        
-        return weak / max(baseline, 1.0)
-    
-    def _over_prof(self, t: TeamStats, o: TeamStats, l: LeagueStats) -> float:
-        """Over/Under profile correction."""
-        t_tend = 0.5*(t.over_5_5_pct/100) + 0.5*(t.over_4_5_pct/100)
-        o_tend = o.over_5_5_against_pct / 100
-        l_tend = 0.5
-        
-        corr = ((t_tend + o_tend)/2 - l_tend) * l.avg_corners * 0.15
-        return corr
-    
-    def _form(self, t: TeamStats, l: LeagueStats, is_home: bool) -> float:
-        """Form adjustment."""
-        ppg_mom = (t.ppg_l5 - t.ppg_l10) / max(t.ppg_l10, 0.5)
-        win_mom = t.won_l5 - t.won_l10
-        mom = 0.6*ppg_mom + 0.4*win_mom
-        
-        baseline = l.home_avg if is_home else l.away_avg
-        return mom * baseline * 0.10
-    
-    def _time(self, t: TeamStats, l: LeagueStats) -> float:
-        """Time profile."""
-        early = t.corners_0_10_pct / 100
-        late = t.corners_80_ft_pct / 100
-        
-        if t.corners_ht_l5 and t.corners_sh_l5:
-            ht_dom = t.corners_ht_l5 / max(t.corners_ht_l5 + t.corners_sh_l5, 1.0)
-        else:
-            ht_dom = 0.5
-        
-        factor = 0.3*early + 0.3*late + 0.4*ht_dom
-        return (factor - 0.5) * l.avg_corners * 0.05
-    
-    def _gen_tips(self, lh: float, la: float, lt: float) -> List[Dict]:
-        """Tippek generálása."""
-        tips = []
-        c = self.config
-        
-        # Total
-        for k in [8, 9, 10, 11, 12]:
-            prob = 1 - poisson.cdf(k, lt)
-            delta = lt - (k + 0.5)
-            buf = c.BUFFER_MULT * np.sqrt(lt)
-            
-            if prob >= c.MIN_PROB and delta >= buf:
-                tips.append({
-                    'type': 'TOTAL',
-                    'line': f'Over {k}.5',
-                    'prob': prob*100,
-                    'lambda': lt,
-                    'delta': delta,
-                    'buffer': buf
-                })
-        
-        # Home
-        for k in [3, 4, 5, 6]:
-            prob = 1 - poisson.cdf(k, lh)
-            delta = lh - (k + 0.5)
-            buf = c.BUFFER_MULT * np.sqrt(lh)
-            
-            if prob >= c.MIN_PROB and delta >= buf:
-                tips.append({
-                    'type': 'HOME',
-                    'line': f'Home Over {k}.5',
-                    'prob': prob*100,
-                    'lambda': lh,
-                    'delta': delta,
-                    'buffer': buf
-                })
-        
-        # Away
-        for k in [3, 4, 5, 6]:
-            prob = 1 - poisson.cdf(k, la)
-            delta = la - (k + 0.5)
-            buf = c.BUFFER_MULT * np.sqrt(la)
-            
-            if prob >= c.MIN_PROB and delta >= buf:
-                tips.append({
-                    'type': 'AWAY',
-                    'line': f'Away Over {k}.5',
-                    'prob': prob*100,
-                    'lambda': la,
-                    'delta': delta,
-                    'buffer': buf
-                })
-        
-        return tips
-    
-    def _breakdown(self, h: TeamStats, a: TeamStats, l: LeagueStats) -> Dict:
-        """Debug breakdown."""
-        return {
-            'h_direct': self._direct(h, l, True),
-            'h_ad': self._attack_defense(h, a, l, True),
-            'h_over': self._over_prof(h, a, l),
-            'h_form': self._form(h, l, True),
-            'h_time': self._time(h, l),
-            'a_direct': self._direct(a, l, False),
-            'a_ad': self._attack_defense(a, h, l, False),
-            'a_over': self._over_prof(a, h, l),
-            'a_form': self._form(a, l, False),
-            'a_time': self._time(a, l),
-        }
-
-
-# =============================================================================
-# MAIN INTERFACE
-# =============================================================================
-
-def analyze(liga_file, home_all_file, home_home_file, away_all_file, away_away_file):
+def parse_numeric_token(token: str) -> Optional[float]:
     """
-    5 fájlból teljes elemzés.
+    '41%' -> 0.41
+    '5.44' -> 5.44
+    '5,44' -> 5.44
+    '/' -> None
     """
-    # Fájlok beolvasása
-    with open(liga_file, 'r', encoding='utf-8') as f:
-        liga_raw = f.read()
-    with open(home_all_file, 'r', encoding='utf-8') as f:
-        home_all_raw = f.read()
-    with open(home_home_file, 'r', encoding='utf-8') as f:
-        home_home_raw = f.read()
-    with open(away_all_file, 'r', encoding='utf-8') as f:
-        away_all_raw = f.read()
-    with open(away_away_file, 'r', encoding='utf-8') as f:
-        away_away_raw = f.read()
-    
-    # Parsing
-    parser = Parser()
-    league = parser.parse_league(liga_raw)
-    home_all = parser.parse_team(home_all_raw, 'all')
-    home_home = parser.parse_team(home_home_raw, 'home')
-    away_all = parser.parse_team(away_all_raw, 'all')
-    away_away = parser.parse_team(away_away_raw, 'away')
-    
-    # Predikció
-    model = CornerModel()
-    result = model.predict(league, home_all, home_home, away_all, away_away)
-    
-    # Report
-    match_name = f"{home_home.name} vs {away_away.name}"
-    report = format_report(match_name, league.name, result)
-    
-    return {
-        'match': match_name,
-        'result': result,
-        'report': report
-    }
+    s = token.strip().replace(",", ".")
+    if s in {"/", "-", "—"}:
+        return None
 
+    if re.fullmatch(r"-?\d+(?:\.\d+)?%", s):
+        return float(s[:-1]) / 100.0
 
-def format_report(match: str, league: str, r: Dict) -> str:
-    """Formázott output."""
-    lines = []
-    lines.append(f"\n{'='*75}")
-    lines.append(f"{'CORNER MODEL v14.0':^75}")
-    lines.append(f"{'='*75}")
-    lines.append(f"\n📊 {match} ({league})\n")
-    
-    lines.append(f"{'─'*75}")
-    lines.append(f"VÁRHATÓ SZÖGLETEK:")
-    lines.append(f"  🏠 Hazai:  λ={r['lambda_home']:.2f}  →  {r['pred_home']} szöglet")
-    lines.append(f"  ✈️  Vendég: λ={r['lambda_away']:.2f}  →  {r['pred_away']} szöglet")
-    lines.append(f"  🎯 Total:  λ={r['lambda_total']:.2f}  →  {r['pred_total']} szöglet")
-    lines.append(f"\n  📈 90% Confidence: {r['confidence']}")
-    
-    if r['tips']:
-        lines.append(f"\n{'─'*75}")
-        lines.append(f"✅ AJÁNLOTT TIPPEK:\n")
-        for t in r['tips']:
-            lines.append(
-                f"  [{t['type']:6}] {t['line']:16} | "
-                f"P={t['prob']:5.1f}% | λ={t['lambda']:.2f} | "
-                f"Δ={t['delta']:+.2f} (min: {t['buffer']:.2f})"
-            )
-    else:
-        lines.append(f"\n⚠️  Nincs ajánlott tipp (puffer/prob túl alacsony)")
-    
-    lines.append(f"\n{'─'*75}")
-    lines.append(f"KOMPONENS BREAKDOWN:\n")
-    
-    bd = r['breakdown']
-    lines.append(f"HAZAI λ={r['lambda_home']:.2f}:")
-    lines.append(f"  Direct (45%):      {bd['h_direct']:.2f}")
-    lines.append(f"  Attack-Def (25%):  {bd['h_ad']:.2f}")
-    lines.append(f"  Over Prof (15%):   {bd['h_over']:+.2f}")
-    lines.append(f"  Form (10%):        {bd['h_form']:+.2f}")
-    lines.append(f"  Time (5%):         {bd['h_time']:+.2f}")
-    
-    lines.append(f"\nVENDÉG λ={r['lambda_away']:.2f}:")
-    lines.append(f"  Direct (45%):      {bd['a_direct']:.2f}")
-    lines.append(f"  Attack-Def (25%):  {bd['a_ad']:.2f}")
-    lines.append(f"  Over Prof (15%):   {bd['a_over']:+.2f}")
-    lines.append(f"  Form (10%):        {bd['a_form']:+.2f}")
-    lines.append(f"  Time (5%):         {bd['a_time']:+.2f}")
-    
-    lines.append(f"\n{'='*75}\n")
-    
-    return '\n'.join(lines)
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", s):
+        return float(s)
+
+    return None
+
+def first_numeric_after_label(lines: List[str], label: str, lookahead: int = 8) -> Optional[float]:
+    target = norm_text(label)
+    for i, line in enumerate(lines):
+        if norm_text(line) == target:
+            for j in range(i + 1, min(len(lines), i + 1 + lookahead)):
+                v = parse_numeric_token(lines[j])
+                if v is not None:
+                    return v
+    return None
+
+def triplet_after_label(lines: List[str], label: str, lookahead: int = 12) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Egy label után a következő 3 numerikus érték = L5, L10, All
+    """
+    target = norm_text(label)
+    for i, line in enumerate(lines):
+        if norm_text(line) == target:
+            vals = []
+            for j in range(i + 1, min(len(lines), i + 1 + lookahead)):
+                v = parse_numeric_token(lines[j])
+                if v is not None:
+                    vals.append(v)
+                if len(vals) == 3:
+                    return vals[0], vals[1], vals[2]
+    return None, None, None
+
+def add_if_present(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    return a + b
+
+def sub_if_present(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    return a - b
+
+def div_if_present(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b in (None, 0):
+        return None
+    return a / b
+
+def fmt(v: Any) -> str:
+    if v is None:
+        return "MISSING"
+    if isinstance(v, float):
+        return f"{v:.4f}"
+    return str(v)
+
+def write_csv(path: Path, headers: List[str], rows: List[List[Any]]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+def pretty_print_table(title: str, headers: List[str], rows: List[List[Any]], max_rows: Optional[int] = None) -> None:
+    print(f"\n{title}")
+    print("=" * len(title))
+
+    if max_rows is not None:
+        rows = rows[:max_rows]
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    header_line = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    sep = "-+-".join("-" * widths[i] for i in range(len(headers)))
+
+    print(header_line)
+    print(sep)
+
+    for row in rows:
+        print(" | ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))))
 
 
 # =============================================================================
-# CLI
+# 2. KINYERENDŐ MEZŐK
 # =============================================================================
+
+LEAGUE_LABELS = {
+    "league_avg_corners": "Avg. Corners",
+    "league_home_avg_corners": "Home Avg. Corners",
+    "league_away_avg_corners": "Away Avg. Corners",
+    "league_over_8_5": "Over/Under 8.5 Corners",
+    "league_over_9_5": "Over/Under 9.5 Corners",
+    "league_over_10_5": "Over/Under 10.5 Corners",
+    "league_avg_attacks": "Avg. Attacks",
+    "league_avg_dangerous_attacks": "Avg. Dangerous Attacks",
+    "league_avg_sot": "Avg. Shots on Target",
+    "league_avg_sib": "Avg. Shots Inside Box",
+    "league_avg_sob": "Avg. Shots Outside Box",
+    "league_avg_goals": "Avg. Goals",
+    "league_avg_xg": "Avg. Expected Goals",
+    "league_avg_xga": "Avg. Expected Goals Against",
+}
+
+TEAM_LABELS = {
+    # Direct Cornerhez
+    "game_over_9_5": "Over 9.5 game",
+    "game_over_10_5": "Over 10.5 game",
+    "avg_game_corners_fh": "Avg. game corners FH",
+    "avg_game_corners_sh": "Avg. game corners SH",
+    "team_over_4_5": "Over 4.5 team",
+    "team_over_5_5": "Over 5.5 team",
+    "avg_team_corners_against": "Avg. team corners against",
+    "team_against_over_4_5": "Over 4.5 team against",
+    "team_against_over_5_5": "Over 5.5 team against",
+
+    # Attack-Defensehez
+    "avg_dangerous_attacks": "Avg. dangerous attacks",
+    "avg_dangerous_attacks_against": "Avg. dangerous attacks against",
+    "avg_sot": "Avg. shots on target",
+    "avg_sot_against": "Avg. shots on target against",
+
+    # xG opcionális támogató adatok
+    "xg": "Expected goals (xG)",
+    "xga": "Expected goals against (xGA)",
+}
+
+
+# =============================================================================
+# 3. EXTRACTOR
+# =============================================================================
+
+class MakeyourstatStrictExtractor:
+    def parse_league(self, raw: str) -> Dict[str, Optional[float]]:
+        lines = clean_lines(raw)
+        out: Dict[str, Optional[float]] = {}
+
+        out["league_name"] = lines[0] if lines else "Unknown League"
+
+        for key, label in LEAGUE_LABELS.items():
+            out[key] = first_numeric_after_label(lines, label)
+
+        return out
+
+    def parse_team(self, raw: str, prefix: str) -> Dict[str, Optional[float]]:
+        lines = clean_lines(raw)
+        out: Dict[str, Optional[float]] = {}
+
+        out[f"{prefix}_team_name"] = lines[0] if lines else "Unknown Team"
+
+        for key, label in TEAM_LABELS.items():
+            l5, l10, allv = triplet_after_label(lines, label)
+            out[f"{prefix}_{key}_l5"] = l5
+            out[f"{prefix}_{key}_l10"] = l10
+            out[f"{prefix}_{key}_all"] = allv
+
+        return out
+
+    def build_model_ready(self,
+                          league: Dict[str, Optional[float]],
+                          home_all: Dict[str, Optional[float]],
+                          home_home: Dict[str, Optional[float]],
+                          away_all: Dict[str, Optional[float]],
+                          away_away: Dict[str, Optional[float]]) -> List[Dict[str, Any]]:
+
+        model_rows: List[Dict[str, Any]] = []
+
+        # --- League raw rows ---
+        for key in LEAGUE_LABELS.keys():
+            model_rows.append({
+                "group": "league",
+                "feature": key,
+                "value": league.get(key),
+                "formula": "explicit raw",
+                "required_now": "YES"
+            })
+
+        # --- Team derived exact rows ---
+        for prefix, block in [
+            ("home_all", home_all),
+            ("home_home", home_home),
+            ("away_all", away_all),
+            ("away_away", away_away),
+        ]:
+            # Exact total game corners = FH + SH
+            for horizon in ("l5", "l10", "all"):
+                fh = block.get(f"{prefix}_avg_game_corners_fh_{horizon}")
+                sh = block.get(f"{prefix}_avg_game_corners_sh_{horizon}")
+                total_game = add_if_present(fh, sh)
+
+                against = block.get(f"{prefix}_avg_team_corners_against_{horizon}")
+                own = sub_if_present(total_game, against)
+
+                model_rows.append({
+                    "group": prefix,
+                    "feature": f"{prefix}_avg_game_corners_total_{horizon}",
+                    "value": total_game,
+                    "formula": f"{prefix}_avg_game_corners_fh_{horizon} + {prefix}_avg_game_corners_sh_{horizon}",
+                    "required_now": "YES"
+                })
+
+                model_rows.append({
+                    "group": prefix,
+                    "feature": f"{prefix}_own_team_corners_{horizon}",
+                    "value": own,
+                    "formula": f"{prefix}_avg_game_corners_total_{horizon} - {prefix}_avg_team_corners_against_{horizon}",
+                    "required_now": "YES"
+                })
+
+            # Validated attack = SoT / DA (L10, All)
+            for horizon in ("l10", "all"):
+                sot = block.get(f"{prefix}_avg_sot_{horizon}")
+                da = block.get(f"{prefix}_avg_dangerous_attacks_{horizon}")
+                att_val = div_if_present(sot, da)
+
+                sot_ag = block.get(f"{prefix}_avg_sot_against_{horizon}")
+                da_ag = block.get(f"{prefix}_avg_dangerous_attacks_against_{horizon}")
+                def_val = div_if_present(sot_ag, da_ag)
+
+                model_rows.append({
+                    "group": prefix,
+                    "feature": f"{prefix}_attack_validation_{horizon}",
+                    "value": att_val,
+                    "formula": f"{prefix}_avg_sot_{horizon} / {prefix}_avg_dangerous_attacks_{horizon}",
+                    "required_now": "YES"
+                })
+
+                model_rows.append({
+                    "group": prefix,
+                    "feature": f"{prefix}_defense_validation_{horizon}",
+                    "value": def_val,
+                    "formula": f"{prefix}_avg_sot_against_{horizon} / {prefix}_avg_dangerous_attacks_against_{horizon}",
+                    "required_now": "YES"
+                })
+
+            # Explicit over profile rows we will use later
+            for base in [
+                "game_over_9_5",
+                "game_over_10_5",
+                "team_over_4_5",
+                "team_over_5_5",
+                "team_against_over_4_5",
+                "team_against_over_5_5",
+                "xg",
+                "xga",
+            ]:
+                for horizon in ("l10", "all"):
+                    model_rows.append({
+                        "group": prefix,
+                        "feature": f"{prefix}_{base}_{horizon}",
+                        "value": block.get(f"{prefix}_{base}_{horizon}"),
+                        "formula": "explicit raw",
+                        "required_now": "YES" if base != "xg" and base != "xga" else "OPTIONAL"
+                    })
+
+        return model_rows
+
+    def build_audit(self,
+                    league: Dict[str, Optional[float]],
+                    home_all: Dict[str, Optional[float]],
+                    home_home: Dict[str, Optional[float]],
+                    away_all: Dict[str, Optional[float]],
+                    away_away: Dict[str, Optional[float]],
+                    model_rows: List[Dict[str, Any]]) -> str:
+
+        def block_stats(block_name: str, dct: Dict[str, Any]) -> str:
+            keys = [k for k in dct.keys() if not k.endswith("_team_name") and k != "league_name"]
+            found = [k for k in keys if dct[k] is not None]
+            missing = [k for k in keys if dct[k] is None]
+            txt = []
+            txt.append(f"[{block_name}] found={len(found)} missing={len(missing)}")
+            if missing:
+                txt.append("  MISSING:")
+                for m in missing:
+                    txt.append(f"    - {m}")
+            return "\n".join(txt)
+
+        required_rows = [r for r in model_rows if r["required_now"] == "YES"]
+        required_found = [r for r in required_rows if r["value"] is not None]
+        required_missing = [r for r in required_rows if r["value"] is None]
+
+        lines = []
+        lines.append("=== AUDIT REPORT ===")
+        lines.append("")
+        lines.append(block_stats("league", league))
+        lines.append("")
+        lines.append(block_stats("home_all", home_all))
+        lines.append("")
+        lines.append(block_stats("home_home", home_home))
+        lines.append("")
+        lines.append(block_stats("away_all", away_all))
+        lines.append("")
+        lines.append(block_stats("away_away", away_away))
+        lines.append("")
+        lines.append(f"[model_ready_required] found={len(required_found)} missing={len(required_missing)}")
+        if required_missing:
+            lines.append("  MISSING MODEL-READY FEATURES:")
+            for r in required_missing:
+                lines.append(f"    - {r['feature']}  ({r['formula']})")
+
+        return "\n".join(lines)
+
+
+# =============================================================================
+# 4. TÁBLÁK ÉPÍTÉSE
+# =============================================================================
+
+def build_league_table(league: Dict[str, Optional[float]]) -> List[List[Any]]:
+    rows = []
+    for key in LEAGUE_LABELS.keys():
+        rows.append([key, fmt(league.get(key))])
+    return rows
+
+def build_team_table(block_name: str, block: Dict[str, Optional[float]]) -> List[List[Any]]:
+    rows = []
+    for key in TEAM_LABELS.keys():
+        rows.append([
+            block_name,
+            key,
+            fmt(block.get(f"{block_name}_{key}_l5")),
+            fmt(block.get(f"{block_name}_{key}_l10")),
+            fmt(block.get(f"{block_name}_{key}_all")),
+        ])
+    return rows
+
+def build_model_table_rows(model_rows: List[Dict[str, Any]]) -> List[List[Any]]:
+    rows = []
+    for r in model_rows:
+        rows.append([
+            r["group"],
+            r["feature"],
+            fmt(r["value"]),
+            r["formula"],
+            r["required_now"],
+        ])
+    return rows
+
+
+# =============================================================================
+# 5. MAIN
+# =============================================================================
+
+def read_text_file(path_str: str) -> str:
+    path = Path(path_str.strip())
+    return path.read_text(encoding="utf-8")
+
+def main():
+    print("\nMAKEYOURSTAT STRICT EXTRACTOR v1.0")
+    print("5 lépcsős input - explicit adatkinyerés, becslés nélkül\n")
+
+    league_path = input("1/5 - Liga raw txt fájl elérési útja: ").strip()
+    home_all_path = input("2/5 - Hazai ALL raw txt fájl elérési útja: ").strip()
+    home_home_path = input("3/5 - Hazai HOME raw txt fájl elérési útja: ").strip()
+    away_all_path = input("4/5 - Vendég ALL raw txt fájl elérési útja: ").strip()
+    away_away_path = input("5/5 - Vendég AWAY raw txt fájl elérési útja: ").strip()
+
+    out_prefix = input("\nOutput fájl prefix (pl. mariehamn_sjk): ").strip()
+    if not out_prefix:
+        out_prefix = "extract_output"
+
+    league_raw = read_text_file(league_path)
+    home_all_raw = read_text_file(home_all_path)
+    home_home_raw = read_text_file(home_home_path)
+    away_all_raw = read_text_file(away_all_path)
+    away_away_raw = read_text_file(away_away_path)
+
+    extractor = MakeyourstatStrictExtractor()
+
+    league = extractor.parse_league(league_raw)
+    home_all = extractor.parse_team(home_all_raw, "home_all")
+    home_home = extractor.parse_team(home_home_raw, "home_home")
+    away_all = extractor.parse_team(away_all_raw, "away_all")
+    away_away = extractor.parse_team(away_away_raw, "away_away")
+
+    model_rows = extractor.build_model_ready(
+        league=league,
+        home_all=home_all,
+        home_home=home_home,
+        away_all=away_all,
+        away_away=away_away,
+    )
+
+    audit_text = extractor.build_audit(
+        league=league,
+        home_all=home_all,
+        home_home=home_home,
+        away_all=away_all,
+        away_away=away_away,
+        model_rows=model_rows,
+    )
+
+    # --- táblák ---
+    league_table = build_league_table(league)
+    team_table = []
+    team_table.extend(build_team_table("home_all", home_all))
+    team_table.extend(build_team_table("home_home", home_home))
+    team_table.extend(build_team_table("away_all", away_all))
+    team_table.extend(build_team_table("away_away", away_away))
+    model_table = build_model_table_rows(model_rows)
+
+    # --- mentés ---
+    league_csv = Path(f"{out_prefix}_league_table.csv")
+    team_csv = Path(f"{out_prefix}_team_table.csv")
+    model_csv = Path(f"{out_prefix}_model_ready.csv")
+    audit_txt = Path(f"{out_prefix}_audit.txt")
+
+    write_csv(league_csv, ["metric", "value"], league_table)
+    write_csv(team_csv, ["block", "metric", "L5", "L10", "All"], team_table)
+    write_csv(model_csv, ["group", "feature", "value", "formula", "required_now"], model_table)
+
+    with open(audit_txt, "w", encoding="utf-8") as f:
+        f.write(audit_text)
+
+    # --- képernyőre is ---
+    pretty_print_table("LEAGUE TABLE", ["metric", "value"], league_table)
+    pretty_print_table("TEAM TABLE (first 40 rows)", ["block", "metric", "L5", "L10", "All"], team_table, max_rows=40)
+    pretty_print_table("MODEL-READY TABLE", ["group", "feature", "value", "formula", "required_now"], model_table)
+
+    print("\nAUDIT REPORT")
+    print("============")
+    print(audit_text)
+
+    print("\nKész.")
+    print(f"- {league_csv}")
+    print(f"- {team_csv}")
+    print(f"- {model_csv}")
+    print(f"- {audit_txt}")
+    print("\nFONTOS: a százalékok 0-1 skálán vannak tárolva (pl. 41% -> 0.41).")
+
 
 if __name__ == "__main__":
-    print("""
-╔═══════════════════════════════════════════════════════════════════════╗
-║               CORNER PREDICTION MODEL v14.0                           ║
-║                   5 LÉPCSŐS ADAT-BEADÁS                               ║
-╚═══════════════════════════════════════════════════════════════════════╝
-
-HASZNÁLAT:
-  python corner_model_v14.py <liga> <home_all> <home_home> <away_all> <away_away>
-
-PÉLDA:
-  python corner_model_v14.py \\
-      eliteserien.txt \\
-      rosenborg_all.txt \\
-      rosenborg_home.txt \\
-      viking_all.txt \\
-      viking_away.txt
-    """)
-    
-    if len(sys.argv) != 6:
-        print("\n❌ HIBA: Pontosan 5 fájl kell!")
-        print("\n5 LÉPCSŐS STRUKTÚRA:")
-        print("  1️⃣  Liga stat")
-        print("  2️⃣  Hazai csapat ALL stat")
-        print("  3️⃣  Hazai csapat HOME stat")
-        print("  4️⃣  Vendég csapat ALL stat")
-        print("  5️⃣  Vendég csapat AWAY stat\n")
-        sys.exit(1)
-    
-    result = analyze(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
-    print(result['report'])
+    main()
