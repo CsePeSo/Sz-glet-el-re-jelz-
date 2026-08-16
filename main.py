@@ -496,5 +496,18 @@ def main():
     print("\nFONTOS: a százalékok 0-1 skálán vannak tárolva (pl. 41% -> 0.41).")
 
 
+# If Streamlit runs this file (streamlit run main.py), prefer to import the Streamlit UI wrapper
+# so the web UI shows instead of waiting on console input(). If the wrapper is absent or import fails,
+# fall back to the original console main().
 if __name__ == "__main__":
-    main()
+    try:
+        import streamlit  # type: ignore
+        # If streamlit is available in the environment, try to load the web wrapper.
+        try:
+            import streamlit_app  # noqa: F401
+        except Exception:
+            # If wrapper missing or failing, fall back to console behavior
+            main()
+    except Exception:
+        # No streamlit in environment -> run console main
+        main()
