@@ -2,9 +2,8 @@ import streamlit as st
 import io
 import csv
 
-# Import the existing extractor from main.py
-# main.py uses if __name__ == "__main__": main() so importing it is safe
-import main
+# Import specific symbols from console_main to avoid circular imports (main <-> streamlit_app)
+from console_main import MakeyourstatStrictExtractor, build_league_table, build_team_table, build_model_table_rows
 
 st.set_page_config(page_title="MAKEYOURSTAT extractor", layout="wide")
 
@@ -53,7 +52,7 @@ if run:
             away_all_raw = read_uploaded_text(away_all_file)
             away_away_raw = read_uploaded_text(away_away_file)
 
-            extractor = main.MakeyourstatStrictExtractor()
+            extractor = MakeyourstatStrictExtractor()
 
             league = extractor.parse_league(league_raw)
             home_all = extractor.parse_team(home_all_raw, "home_all")
@@ -78,14 +77,14 @@ if run:
                 model_rows=model_rows,
             )
 
-            # Táblák építése (a main modulban lévő helper függvényeket használjuk)
-            league_table = main.build_league_table(league)
+            # Táblák építése (a console_main modulból importált helper függvényeket használjuk)
+            league_table = build_league_table(league)
             team_table = []
-            team_table.extend(main.build_team_table("home_all", home_all))
-            team_table.extend(main.build_team_table("home_home", home_home))
-            team_table.extend(main.build_team_table("away_all", away_all))
-            team_table.extend(main.build_team_table("away_away", away_away))
-            model_table = main.build_model_table_rows(model_rows)
+            team_table.extend(build_team_table("home_all", home_all))
+            team_table.extend(build_team_table("home_home", home_home))
+            team_table.extend(build_team_table("away_all", away_all))
+            team_table.extend(build_team_table("away_away", away_away))
+            model_table = build_model_table_rows(model_rows)
 
             # Megjelenítés
             st.subheader("Audit")
